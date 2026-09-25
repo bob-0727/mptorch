@@ -26,6 +26,7 @@ if torch.cuda.is_available():
 from .number import (
     AccumulateAlgorithm,
     BinaryK,
+    FixedPoint,
     FloatFormat,
     FormatRangeWarning,
     Number,
@@ -46,5 +47,6 @@ __all__ = [
     "FloatFormat",
     "BinaryK",
     "SuperFP",
+    "FixedPoint",
     "FormatRangeWarning",
 ]
