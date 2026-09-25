@@ -45,6 +45,7 @@ import torch
 from mptorch.number import (
     AccumulateAlgorithm,
     BinaryK,
+    FixedPoint,
     Number,
     RoundMode,
     SuperFP,
@@ -68,6 +69,8 @@ from .ops import (
     _superfp_spec,
     binaryK_quantize,
     binaryK_quantize_,
+    fixedpoint_quantize,
+    fixedpoint_quantize_,
     superfp_quantize,
     superfp_quantize_,
 )
@@ -201,8 +204,8 @@ class Quant:
     memoization key like the mac objects.
 
     Args:
-        fmt (Number): the format to round to, a :class:`mptorch.BinaryK` or
-            :class:`mptorch.SuperFP`.
+        fmt (Number): the format to round to, a :class:`mptorch.BinaryK`,
+            :class:`mptorch.SuperFP` or :class:`mptorch.FixedPoint`.
         rounding (RoundMode): the rounding mode. Default: ``RoundMode.RNE``
         carrier (torch.dtype, optional): the float arithmetic the cast rounds
             in, :func:`mptorch.quant.binaryK_quantize`'s argument of that
@@ -213,7 +216,8 @@ class Quant:
             tensor. Default: ``None``
         inplace (bool): round the tensor in place and return it, through
             :func:`mptorch.quant.binaryK_quantize_` /
-            :func:`mptorch.quant.superfp_quantize_`, instead of allocating a
+            :func:`mptorch.quant.superfp_quantize_` /
+            :func:`mptorch.quant.fixedpoint_quantize_`, instead of allocating a
             result. For a tensor the caller owns (a weight quantized once at
             load); never for a ``*_quant`` slot of a layer's formats, whose
             input belongs to the graph of whatever produced it. The call then
@@ -278,6 +282,20 @@ class Quant:
                     is_signed=fmt.is_signed,
                     rounding_mode=rm,
                     saturation_mode=fmt.saturation,
+                    carrier=carrier,
+                )
+        elif isinstance(fmt, FixedPoint):
+            fixedpoint = fixedpoint_quantize_ if self.inplace else fixedpoint_quantize
+
+            def call(x: torch.Tensor) -> torch.Tensor:
+                return fixedpoint(
+                    x,
+                    wl=fmt.wl,
+                    fl=fmt.fl,
+                    prng_bits=fmt.prng_bits,
+                    is_signed=fmt.is_signed,
+                    symmetric=fmt.symmetric,
+                    rounding_mode=rm,
                     carrier=carrier,
                 )
 
