@@ -43,10 +43,21 @@ at::Tensor superfp_quantize_mps(at::Tensor a, int64_t man_bits, int64_t exp_bits
                                 int64_t normal_binades, int64_t bias, int64_t prng_bits,
                                 bool is_signed, int64_t round_mode, int64_t saturation_mode);
 
-// The in-place twins, mptorch::binaryK_quant_ and mptorch::superfp_quant_:
-// the same rounding written over `a`, which is returned. They copy nothing,
-// so each refuses what its out-of-place op launders (a strided tensor, and
-// on CUDA a view that starts off a 16-byte boundary). The MPS pair raises:
+at::Tensor fixedpoint_quantize_cuda(at::Tensor a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                    bool is_signed, bool symmetric, int64_t round_mode);
+
+at::Tensor fixedpoint_quantize_cpu(at::Tensor a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                   bool is_signed, bool symmetric, int64_t round_mode);
+
+at::Tensor fixedpoint_quantize_mps(at::Tensor a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                   bool is_signed, bool symmetric, int64_t round_mode);
+
+
+// The in-place twins, mptorch::binaryK_quant_, mptorch::superfp_quant_ and
+// mptorch::fixedpoint_quant_: the same rounding written over `a`, which is
+// returned. They copy nothing, so each refuses what its out-of-place op
+// launders (a strided tensor, and on CUDA a view that starts off a 16-byte
+// boundary). The MPS ones raise:
 // the Metal kernel is dev/continuation_plan.md's phase H.
 at::Tensor &binaryK_quantize_cuda_(at::Tensor &a, int64_t K, int64_t P,
                                    int64_t bias, int64_t prng_bits,
@@ -75,6 +86,16 @@ at::Tensor &superfp_quantize_cpu_(at::Tensor &a, int64_t man_bits, int64_t exp_b
 at::Tensor &superfp_quantize_mps_(at::Tensor &a, int64_t man_bits, int64_t exp_bits,
                                   int64_t normal_binades, int64_t bias, int64_t prng_bits,
                                   bool is_signed, int64_t round_mode, int64_t saturation_mode);
+
+at::Tensor &fixedpoint_quantize_cuda_(at::Tensor &a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                      bool is_signed, bool symmetric, int64_t round_mode);
+
+at::Tensor &fixedpoint_quantize_cpu_(at::Tensor &a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                     bool is_signed, bool symmetric, int64_t round_mode);
+
+at::Tensor &fixedpoint_quantize_mps_(at::Tensor &a, int64_t wl, int64_t fl, int64_t prng_bits,
+                                     bool is_signed, bool symmetric, int64_t round_mode);
+
 
 // A float64 tensor rounded once, to nearest even, onto float32, float16 or
 // bfloat16: the store of a result computed in binary64 for a narrower

@@ -50,7 +50,7 @@ namespace
   }
 
   // The boxed Autograd kernel. Boxed (arguments on the stack, one kernel for
-  // every schema) so the same function serves all seventeen ops. It raises when
+  // every schema) so the same function serves all nineteen ops. It raises when
   // a gradient would be expected, with a message specific to what the op is
   // (a GEMM, the narrowing store, or an elementwise quantizer), and
   // otherwise redispatches to the backend kernel below the autograd keys,
@@ -94,6 +94,8 @@ TORCH_LIBRARY_IMPL(mptorch, Autograd, m)
   m.impl("superfp_quant", kernel());
   m.impl("binaryK_quant_", kernel());
   m.impl("superfp_quant_", kernel());
+  m.impl("fixedpoint_quant", kernel());
+  m.impl("fixedpoint_quant_", kernel());
   m.impl("narrow_float64", kernel());
   m.impl("custom_matmul_binaryK", kernel());
   m.impl("custom_matmul_superfp", kernel());
@@ -109,7 +111,7 @@ TORCH_LIBRARY_IMPL(mptorch, Autograd, m)
   m.impl("custom_matmul_superfp_fma_accumulated", kernel());
 }
 
-// The two in-place quantizers also need the ADInplaceOrView key, which is
+// The three in-place quantizers also need the ADInplaceOrView key, which is
 // where ATen's own in-place ops bump their tensor's version counter. The
 // backend kernels write through data_ptr() and go around ATen entirely, so
 // nothing else would: a tensor saved for backward and then quantized in place
@@ -121,4 +123,5 @@ TORCH_LIBRARY_IMPL(mptorch, ADInplaceOrView, m)
 {
   m.impl("binaryK_quant_", torch::autograd::autogradNotImplementedInplaceOrViewFallback());
   m.impl("superfp_quant_", torch::autograd::autogradNotImplementedInplaceOrViewFallback());
+  m.impl("fixedpoint_quant_", torch::autograd::autogradNotImplementedInplaceOrViewFallback());
 }
