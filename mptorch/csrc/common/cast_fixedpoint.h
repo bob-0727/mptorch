@@ -16,8 +16,8 @@
 // binaryK's man_bits - (min_exp - target_exp) with the step in place of its
 // smallest subnormal; a value under the step (exp_diff < 0) is zero or the
 // step; and the result saturates to the ends of the range, which have no
-// infinity beyond them. Only round-to-nearest-even is implemented so far: the
-// other casts return their input unchanged.
+// infinity beyond them. Stochastic rounding is not implemented yet: its cast
+// returns its input unchanged.
 
 // The constants the casts read, flat for the reason BinaryKParamsT is (a
 // nested aggregate in the GEMM instantiations costs nvcc minutes).
@@ -107,15 +107,17 @@ CUDA_HOST_DEVICE_INLINE T fixedpoint_nonfinite(T x, const MPTORCH_THREAD FixedPo
     return (target & F::SIGN_MASK) ? p.min_val : p.max_val;
 }
 
-// Rounds to nearest, ties to the even code. binaryK's subnormal arm with
-// exp_diff = target_exp + fl, then the saturation to the range.
+// Rounds to nearest, ties to even: the NearestTiesToEven projection of x onto
+// the fixed-point format p describes, where "even" is the parity of the
+// integer code. A negative input to an unsigned format returns 0, a NaN passes
+// through, and every other value is binaryK's subnormal arm with exp_diff =
+// target_exp + fl, saturated to the range.
 template <class T>
 CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_nearest_even(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
 {
     using F = FloatTraits<T>;
     using word_t = typename F::word_t;
 
-    // an unsigned format has no negative values
     if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
         return T(0);
 
@@ -125,57 +127,170 @@ CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_nearest_even(T x, bool is_signed, cons
     if (target_exp == F::INF_EXP)
         return fixedpoint_nonfinite(x, p);
 
-    // bits kept below the leading one, down to the step; negative under the step
+    // the bits kept below the leading one, down to the step: negative for a
+    // value under the step, which is then zero or the step. Half a step is
+    // the tie, and zero the even code, so only a value above half leaves zero.
     int exp_diff = target_exp + p.fl;
-    // zero unless the value is at least the step, or above half of it (half is
-    // the tie, and zero the even code)
     int not_uflow = exp_diff > -1 || ((exp_diff == -1) && ((target << (F::EXP_BITS + 1)) > 0));
 
-    // rounded only when it is not zero
+    // Rounded only where the result is nonzero: binaryK's subnormal arm never
+    // sees an exp_diff below -2, but a tiny input's here would shift the word
+    // past its width, which C++ leaves undefined.
     word_t quantize_bits = not_uflow ? round_bitwise_nearest_even(target, exp_diff) : word_t(0);
-    // lifts a value rounded up to the step onto it, and makes a rounded zero +0.0
     quantize_bits = clip_subnormal_range_exponent(target, quantize_bits, p.step_exponent_store);
     T quantized = reinterpret_cast<const MPTORCH_THREAD T &>(quantize_bits);
 
     return fixedpoint_saturate(quantized, p);
 }
 
-// PLACEHOLDER: returns its input unchanged until it is written.
+// Rounds to nearest, ties away from zero. Under the step, half a step is a tie
+// the step wins, so every value from exp_diff == -1 up is nonzero.
 template <class T>
 CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_nearest_away(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
 {
-    return x;
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
+        return T(0);
+
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    int target_exp = (int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS;
+
+    if (target_exp == F::INF_EXP)
+        return fixedpoint_nonfinite(x, p);
+
+    int exp_diff = target_exp + p.fl;
+    int not_uflow = exp_diff >= -1;
+
+    word_t quantize_bits = not_uflow ? round_bitwise_nearest_away(target, exp_diff) : word_t(0);
+    quantize_bits = clip_subnormal_range_exponent(target, quantize_bits, p.step_exponent_store);
+    T quantized = reinterpret_cast<const MPTORCH_THREAD T &>(quantize_bits);
+
+    return fixedpoint_saturate(quantized, p);
 }
 
-// PLACEHOLDER: returns its input unchanged until it is written.
-template <class T>
-CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_up(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
-{
-    return x;
-}
-
-// PLACEHOLDER: returns its input unchanged until it is written.
-template <class T>
-CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_down(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
-{
-    return x;
-}
-
-// PLACEHOLDER: returns its input unchanged until it is written.
-template <class T>
-CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_zero(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
-{
-    return x;
-}
-
-// PLACEHOLDER: returns its input unchanged until it is written.
+// Rounds to odd. Under the step the candidates are zero (code 0) and the step
+// (code 1), so every nonzero value there rounds to the step: the power of two
+// under it is taken, and the _up clip lifts it onto the step. At exp_diff ==
+// 0 that power of two is the step itself, code 1, already odd.
 template <class T>
 CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_odd(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
 {
-    return x;
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
+        return T(0);
+
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    int target_exp = (int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS;
+
+    if (target_exp == F::INF_EXP)
+        return fixedpoint_nonfinite(x, p);
+
+    int exp_diff = target_exp + p.fl;
+
+    word_t quantize_bits = (exp_diff > 0) ? round_bitwise_odd(target, exp_diff) : (target & ~F::MAN_MASK);
+    quantize_bits = clip_subnormal_range_exponent_up(target, quantize_bits, p.step_exponent_store);
+    T quantized = reinterpret_cast<const MPTORCH_THREAD T &>(quantize_bits);
+
+    return fixedpoint_saturate(quantized, p);
 }
 
-// PLACEHOLDER: returns its input unchanged until it is written.
+// Rounds a magnitude up (away from zero), for cast_fixedpoint_up and
+// cast_fixedpoint_down: assumes x >= 0 and finite. Under the step the value
+// rounds up to a whole power of two, which the _up clip lifts onto the step.
+template <class T>
+CUDA_HOST_DEVICE_INLINE T fixedpoint_absolute_up(T x, const MPTORCH_THREAD FixedPointParamsT<T> &p)
+{
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    int target_exp = (int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS;
+    int exp_diff = target_exp + p.fl;
+
+    word_t quantize_bits = round_bitwise_up(target, exp_diff < 0 ? 0 : exp_diff);
+    quantize_bits = clip_subnormal_range_exponent_up(target, quantize_bits, p.step_exponent_store);
+    return reinterpret_cast<const MPTORCH_THREAD T &>(quantize_bits);
+}
+
+// Rounds a magnitude down (toward zero); the other half of
+// fixedpoint_absolute_up.
+template <class T>
+CUDA_HOST_DEVICE_INLINE T fixedpoint_absolute_down(T x, const MPTORCH_THREAD FixedPointParamsT<T> &p)
+{
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    int target_exp = (int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS;
+    int exp_diff = target_exp + p.fl;
+
+    word_t quantize_bits = (exp_diff >= 0) ? round_bitwise_down(target, exp_diff) : word_t(0);
+    quantize_bits = clip_subnormal_range_exponent(target, quantize_bits, p.step_exponent_store);
+    return reinterpret_cast<const MPTORCH_THREAD T &>(quantize_bits);
+}
+
+// The three directed modes (toward +inf, toward -inf, toward zero) in terms
+// of the two magnitude helpers above, as in cast_binaryK_up: rounding a
+// negative value up is rounding its magnitude down, and so on. Unlike
+// binaryK's, they saturate after the sign is back on, since the range is not
+// symmetric: -2 is a value of wl=4, fl=2, and +2 is not.
+template <class T>
+CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_up(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
+{
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
+        return T(0);
+
+    // A NaN or an infinity is settled before the sign is taken off, so the
+    // helpers only ever see a finite magnitude. The sign goes off and back on
+    // on the word (flip_sign, negate_magnitude), so a magnitude that rounded
+    // to zero comes back +0.0 and no payload is canonicalized.
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    if ((int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS == F::INF_EXP)
+        return fixedpoint_nonfinite(x, p);
+
+    T rounded = MPTORCH_IS_NONNEGATIVE(x) ? fixedpoint_absolute_up(x, p)
+                                          : negate_magnitude(fixedpoint_absolute_down(flip_sign(x), p));
+    return fixedpoint_saturate(rounded, p);
+}
+
+template <class T>
+CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_down(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
+{
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
+        return T(0);
+
+    // see cast_fixedpoint_up
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    if ((int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS == F::INF_EXP)
+        return fixedpoint_nonfinite(x, p);
+
+    T rounded = MPTORCH_IS_NONNEGATIVE(x) ? fixedpoint_absolute_down(x, p)
+                                          : negate_magnitude(fixedpoint_absolute_up(flip_sign(x), p));
+    return fixedpoint_saturate(rounded, p);
+}
+
+// Rounds toward zero: down for a non-negative value, up for a negative one.
+// A NaN compares false and takes the up arm, which passes it through.
+template <class T>
+CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_zero(T x, bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
+{
+    if (MPTORCH_IS_NONNEGATIVE(x))
+        return cast_fixedpoint_down(x, is_signed, p);
+    return cast_fixedpoint_up(x, is_signed, p);
+}
+
+// Stochastic rounding. PLACEHOLDER: returns its input unchanged until it is
+// written.
 template <class T>
 CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_stochastic(T x, typename FloatTraits<T>::word_t rand_prob, int prng_bits,
                                                      bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)

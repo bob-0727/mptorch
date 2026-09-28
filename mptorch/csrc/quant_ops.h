@@ -57,8 +57,9 @@ at::Tensor fixedpoint_quantize_mps(at::Tensor a, int64_t wl, int64_t fl, int64_t
 // mptorch::fixedpoint_quant_: the same rounding written over `a`, which is
 // returned. They copy nothing, so each refuses what its out-of-place op
 // launders (a strided tensor, and on CUDA a view that starts off a 16-byte
-// boundary). The MPS ones raise:
-// the Metal kernel is dev/continuation_plan.md's phase H.
+// boundary). The binaryK and superfp MPS ones raise: the Metal kernel is
+// dev/continuation_plan.md's phase H. The fixed-point CUDA and MPS functions
+// are declared here and not yet written, for either op.
 at::Tensor &binaryK_quantize_cuda_(at::Tensor &a, int64_t K, int64_t P,
                                    int64_t bias, int64_t prng_bits,
                                    bool is_signed, int64_t round_mode,

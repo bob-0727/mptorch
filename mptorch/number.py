@@ -1553,7 +1553,8 @@ class Number:
 
     Subclassed by :class:`FloatFormat` and :class:`FixedPoint` today.
     :class:`FixedPoint` is a work in progress: it has an elementwise
-    quantizer, and no GEMM yet. Block floating point, block minifloats,
+    quantizer on the CPU in every rounding mode but :attr:`RoundMode.SR`, and
+    no GEMM yet. Block floating point, block minifloats,
     logarithmic and tapered (posit) formats belong here too; each needs a
     kernel first, so none of them is declared as an empty class in the
     meantime.
@@ -1781,7 +1782,8 @@ class FixedPoint(Number):
     negative for a step coarser than 1, above ``wl`` for a format of pure
     fractions.
 
-    Every :class:`RoundMode` applies, as for :class:`BinaryK`. Below the step
+    Every :class:`RoundMode` applies, as for :class:`BinaryK`, except
+    :attr:`RoundMode.SR`, which is not implemented yet. Below the step
     the two candidates are zero and ``2**-fl``, picked as :class:`SubnormalsMode`
     describes. A result beyond the range saturates to its end, an infinite
     input included, because a fixed-point word has no code for an infinity, so

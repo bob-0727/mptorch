@@ -1,12 +1,13 @@
 """The fixed-point format object and its carrier and storage checks.
 
-This module guards ``FixedPoint`` and the fixed-point checks of ``mptorch.number``
-while there is no fixed-point quantizer to call them through. The float formats'
-equivalents live in ``tests/test_number_formats.py`` (the format objects) and
+This module guards ``FixedPoint`` and the fixed-point checks of ``mptorch.number``,
+calling the checks directly. The float formats' equivalents live in
+``tests/test_number_formats.py`` (the format objects) and
 ``tests/test_format_limits.py`` (the checks), where every boundary is held
-through a real call, ``Quant(fmt)(tensor)``. Once ``fixedpoint_quantize`` exists,
-the cases here should move into those files' tests, by topic, beside the
-binaryK and superfp cases, leaving only what is fixed-point specific.
+through a real call, ``Quant(fmt)(tensor)``, on every backend. The fixed-point
+quantizer has a CPU kernel only so far, so its cases stay here until the CUDA
+and MPS kernels exist; then they move into those files' tests, by topic, beside
+the binaryK and superfp cases, leaving only what is fixed-point specific.
 
 A fixed-point format has no exponent field: its range is its precision, the
 ``mag_bits`` of its largest value, that value's leading bit, and its step
