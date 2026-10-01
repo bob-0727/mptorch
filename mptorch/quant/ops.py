@@ -1478,8 +1478,7 @@ def fixedpoint_quantize(
 
     Dtypes, the carrier, the storage check, ``prng_bits`` and
     differentiability are as for :func:`binaryK_quantize`. It has no CUDA or
-    MPS kernel yet and raises on a tensor of either, and ``RoundMode.SR`` is
-    not implemented yet: under it the values come back unrounded.
+    MPS kernel yet and raises on a tensor of either.
 
     Args:
         x (Tensor): the tensor to round; float32, float64, float16 or
@@ -1502,9 +1501,10 @@ def fixedpoint_quantize(
 
     Raises:
         ValueError: if the carrier cannot hold the format (more bits of
-            precision than it has, with or without ``prng_bits``, or a largest
-            value below its normals), for a layout with no values (``wl`` too
-            short, a symmetric unsigned format, negative ``prng_bits``), or if
+            precision than its mantissa has, with or without ``prng_bits``, a
+            largest value below its normals, or a range reaching its top
+            binade), for a layout with no values (``wl`` too short, a
+            symmetric unsigned format, negative ``prng_bits``), or if
             ``carrier`` is a dtype that names no carrier or is narrower than
             ``x``.
         TypeError: if ``carrier`` is neither a ``torch.dtype`` nor ``None``.

@@ -16,8 +16,9 @@
 // binaryK's man_bits - (min_exp - target_exp) with the step in place of its
 // smallest subnormal; a value under the step (exp_diff < 0) is zero or the
 // step; and the result saturates to the ends of the range, which have no
-// infinity beyond them. Stochastic rounding is not implemented yet: its cast
-// returns its input unchanged.
+// infinity beyond them. Stochastic rounding follows binaryK's subnormal SR arm
+// instead: one shift puts every value under a single leading bit, where one
+// round at a fixed position lands on the grid.
 
 // The constants the casts read, flat for the reason BinaryKParamsT is (a
 // nested aggregate in the GEMM instantiations costs nvcc minutes).
@@ -26,7 +27,9 @@ struct FixedPointParamsT
 {
     int fl;                  // exp_diff = target_exp + fl, the bits a value keeps
     int step_exponent_store; // the carrier's exponent field of the step 2^-fl
-    T max_val;               // the largest value, which +inf and overflow saturate to
+    int mag_bits;            // the bits stochastic rounding keeps below its shift
+    int shift_exp;           // mag_bits - fl: SR's shift, one binade above the largest value
+    T max_val;              // the largest value, which +inf and overflow saturate to
     T min_val;               // the smallest: 0 unsigned, -max_val symmetric, else -2^(mag_bits - fl)
 };
 
@@ -57,6 +60,8 @@ CUDA_HOST_DEVICE_INLINE FixedPointParamsT<T> make_fixedpoint_params(int wl, int 
     FixedPointParamsT<T> p;
     p.fl = fl;
     p.step_exponent_store = F::BIAS - fl;
+    p.mag_bits = mag_bits;
+    p.shift_exp = min_exp;
 
     if (top_exp > F::MAX_EXP)
         p.max_val = fixedpoint_word_value<T>(F::INF_BITS);
@@ -289,11 +294,45 @@ CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_zero(T x, bool is_signed, const MPTORC
     return cast_fixedpoint_up(x, is_signed, p);
 }
 
-// Stochastic rounding. PLACEHOLDER: returns its input unchanged until it is
-// written.
+// Stochastic rounding: adds prng_bits random bits below the step and truncates
+// (P3109's StochasticA). Like cast_binaryK_stochastic, rand_prob (a word of
+// the carrier whose MAN_BITS low bits are the draw) and prng_bits stay per-call
+// arguments. The cast is binaryK's subnormal SR arm over the whole range:
+// adding 2^shift_exp, with the input's sign, puts every value in the binade
+// whose grid at mag_bits is the step, so one stochastic round at mag_bits
+// lands on it; the exact subtraction afterwards moves it back, and a value
+// that rounded to zero comes back +0.0.
 template <class T>
 CUDA_HOST_DEVICE_INLINE T cast_fixedpoint_stochastic(T x, typename FloatTraits<T>::word_t rand_prob, int prng_bits,
                                                      bool is_signed, const MPTORCH_THREAD FixedPointParamsT<T> &p)
 {
-    return x;
+    using F = FloatTraits<T>;
+    using word_t = typename F::word_t;
+
+    if (MPTORCH_IS_NEGATIVE(x) && !is_signed)
+        return T(0);
+
+    word_t target = reinterpret_cast<const MPTORCH_THREAD word_t &>(x);
+    int target_exp = (int)((target >> F::MAN_BITS) & F::FIELD_MASK) - F::BIAS;
+
+    if (target_exp == F::INF_EXP)
+        return fixedpoint_nonfinite(x, p);
+
+    // keep only the prng_bits draw bits directly below the mag_bits kept ones
+    rand_prob = rand_prob & F::MAN_MASK;
+    rand_prob = rand_prob & ~((word_t(1) << (F::MAN_BITS - p.mag_bits - prng_bits)) - 1u);
+
+    // A value at or past the shift is past the range: it saturates without
+    // rounding, so the add below never leaves the shift's binade.
+    if (target_exp >= p.shift_exp)
+        return fixedpoint_saturate(x, p);
+
+    word_t shift_bits = ((word_t)(p.shift_exp + F::BIAS) << F::MAN_BITS) | (target & F::SIGN_MASK);
+    T shift = reinterpret_cast<const MPTORCH_THREAD T &>(shift_bits);
+    T val = MPTORCH_ADD_TO_POWER_OF_TWO(x, shift);
+    word_t val_bits = reinterpret_cast<const MPTORCH_THREAD word_t &>(val);
+    word_t q = round_bitwise_stochastic(val_bits, rand_prob, p.mag_bits);
+    T quantized = reinterpret_cast<const MPTORCH_THREAD T &>(q) - shift;
+
+    return fixedpoint_saturate(quantized, p);
 }

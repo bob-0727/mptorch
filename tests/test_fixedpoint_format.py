@@ -120,12 +120,16 @@ def test_palette_rejects_a_family_with_no_gemm():
 @pytest.mark.parametrize(
     ("ok", "bad", "match"),
     [
-        # precision: binary32 has 24 significand bits, a signed word one more
-        (_fxp(25, 0), _fxp(26, 0), "needs 25 bits of precision; binary32 has 24"),
-        (_fxp(24, 0, is_signed=False), _fxp(25, 0, is_signed=False), "needs 25 bits"),
-        (_fxp(54, 0, carrier=F64), _fxp(55, 0, carrier=F64), "needs 54 bits.*binary64 has 53"),
-        # stochastic rounding draws its bits below the step, in the same significand
-        (_fxp(17, 4, prng_bits=8), _fxp(18, 4, prng_bits=8), r"17 \+ 8 \(prng_bits\)"),
+        # precision: stochastic rounding keeps every magnitude bit in binary32's
+        # 23 mantissa bits, as binaryK keeps its man_bits; a signed word has one more
+        (_fxp(24, 0), _fxp(25, 0), "needs 24 bits of precision; binary32 has 23"),
+        (_fxp(23, 0, is_signed=False), _fxp(24, 0, is_signed=False), "needs 24 bits"),
+        (_fxp(53, 0, carrier=F64), _fxp(54, 0, carrier=F64), "needs 53 bits.*binary64 has 52"),
+        # stochastic rounding draws its bits below the step, in the same mantissa
+        (_fxp(16, 4, prng_bits=8), _fxp(17, 4, prng_bits=8), r"16 \+ 8 \(prng_bits\)"),
+        # stochastic rounding's shift, one binade above the top, is a carrier value
+        (_fxp(8, -120), _fxp(8, -121), "top binade, 2\\^127"),
+        (_fxp(8, -1016, carrier=F64), _fxp(8, -1017, carrier=F64), "top binade, 2\\^1023"),
     ],
 )
 def test_fixedpoint_carrier_boundaries_raise(ok, bad, match):
@@ -147,15 +151,15 @@ def test_a_fixedpoint_below_the_carriers_normals_raises():
 @pytest.mark.parametrize(
     ("ok", "bad", "match"),
     [
-        # the largest value's leading bit above binary32's, 2**127
-        (_fxp(8, -121), _fxp(8, -122), "exceeds binary32's largest value"),
         # a step below the floor the cast places values by, 2**-125
         (_fxp(8, 125), _fxp(8, 126), r"step, 2\^-126, is below 2\^-125"),
         (_fxp(8, 1021, carrier=F64), _fxp(8, 1022, carrier=F64), r"below 2\^-1021"),
     ],
 )
 def test_fixedpoint_carrier_boundaries_warn(ok, bad, match):
-    """A range past the carrier's at either end quantizes partially, and warns."""
+    """A step below the carrier's floor quantizes partially, and warns. The top
+    has no warning: a range reaching the carrier's top binade is an error, since
+    stochastic rounding's shift would not be a carrier value."""
     _silent(ok)
     with pytest.warns(FormatRangeWarning, match=match):
         bad()
@@ -195,7 +199,7 @@ def test_building_a_fixedpoint_raises_only_what_binary64_cannot_do():
         FixedPoint(8, -122)  # past binary32's top
         FixedPoint(8, 126)  # below binary32's floor
     assert caught == []
-    with pytest.raises(ValueError, match="binary64 has 53"):
+    with pytest.raises(ValueError, match="binary64 has 52"):
         FixedPoint(60, 4)
 
 
@@ -203,7 +207,7 @@ def test_a_fixedpoint_carrier_warning_names_the_callers_line():
     """The per-call check names the caller's line, as the float formats' do."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FormatRangeWarning)
-        check_fixedpoint_carrier(8, -122, carrier=F32)
+        check_fixedpoint_carrier(8, 126, carrier=F32)  # a step below binary32's floor
     assert [c.filename for c in caught] == [__file__]
 
 

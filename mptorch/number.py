@@ -796,11 +796,15 @@ def _fixedpoint_findings(
     The fixed-point twin of `_binaryK_findings`. A fixed-point format has no
     exponent field, so `_width_error` and `_range_findings` do not apply: its
     range is its precision, the leading bit of its largest value, and its
-    step, each held against the carrier's here. The layout is checked first,
-    and returned as is, since no carrier holds it.
+    step, each held against the carrier's here. Stochastic rounding holds a
+    value as a float with mag_bits mantissa bits below the leading bit
+    2^(mag_bits - fl), so the precision rule is binaryK's man_bits rule, and
+    that leading bit must be a carrier value. The layout is checked first, and
+    returned as is, since no carrier holds it.
     """
     label = _fixedpoint_label(wl, fl, is_signed, symmetric)
 
+    # error: a layout with no values (wl too short, symmetric unsigned, negative prng_bits)
     layout_error = _fixedpoint_layout_error(label, wl, is_signed, symmetric, prng_bits)
     if layout_error is not None:
         return layout_error, None
@@ -810,30 +814,31 @@ def _fixedpoint_findings(
     exp_step = -fl
 
     def find(c: _Carrier) -> tuple[str | None, str | None]:
-        # the largest values need every bit of precision
-        if mag_bits > c.precision:
-            return (f"{label} needs {mag_bits} bits of precision; {c.name} has {c.precision}"), None
+        # error: stochastic rounding keeps all mag_bits in the carrier's mantissa
+        if mag_bits > c.man_bits:
+            return (f"{label} needs {mag_bits} bits of precision; {c.name} has {c.man_bits}"), None
 
-        # stochastic rounding draws its bits below the step, in the same significand
-        if mag_bits + prng_bits > c.precision:
+        # error: stochastic rounding draws its bits below the step, in the same significand
+        if mag_bits + prng_bits > c.man_bits:
             return (
                 f"{label} needs {mag_bits} + {prng_bits} (prng_bits) bits of precision; "
-                f"{c.name} has {c.precision}"
+                f"{c.name} has {c.man_bits}"
             ), None
 
-        # the whole range is below the carrier's normals
+        # error: the whole range is below the carrier's normals
         if top_exp < c.min_normal_exp:
             return (
                 f"{label}'s largest value is below {c.name}'s smallest normal, 2^{c.min_normal_exp}"
             ), None
 
-        # partial: the top of the range is past the carrier's largest value
-        if top_exp > c.top_exp:
-            return None, (
-                f"{label}'s range exceeds {c.name}'s largest value; values above it are unreachable"
-            )
+        # error: stochastic rounding adds 2^(mag_bits - fl), which must be a carrier value
+        if mag_bits - fl > c.top_exp:
+            return (
+                f"{label}'s range reaches {c.name}'s top binade, 2^{c.top_exp}; "
+                f"stochastic rounding needs one binade above it"
+            ), None
 
-        # partial: the step is below the floor the casts place values by (`_Carrier`)
+        # warn: the step is below the floor the casts place values by (`_Carrier`)
         if exp_step < c.min_simulable_exp:
             return None, (
                 f"{label}'s step, 2^{exp_step}, is below 2^{c.min_simulable_exp}; "
@@ -973,8 +978,9 @@ def check_fixedpoint(
 
     Raises:
         ValueError: for a layout with no values (see :class:`FixedPoint`),
-            more bits of precision than the carrier has, with or without
-            ``prng_bits``, or a largest value below the carrier's normals.
+            more bits of precision than the carrier's mantissa has, with or
+            without ``prng_bits``, a largest value below the carrier's
+            normals, or a range reaching the carrier's top binade.
     """
     error, warning = _fixedpoint_findings(wl, fl, is_signed, symmetric, prng_bits, carrier)
     if error is not None:
@@ -1553,8 +1559,7 @@ class Number:
 
     Subclassed by :class:`FloatFormat` and :class:`FixedPoint` today.
     :class:`FixedPoint` is a work in progress: it has an elementwise
-    quantizer on the CPU in every rounding mode but :attr:`RoundMode.SR`, and
-    no GEMM yet. Block floating point, block minifloats,
+    quantizer on the CPU, and no GEMM yet. Block floating point, block minifloats,
     logarithmic and tapered (posit) formats belong here too; each needs a
     kernel first, so none of them is declared as an empty class in the
     meantime.
@@ -1782,8 +1787,7 @@ class FixedPoint(Number):
     negative for a step coarser than 1, above ``wl`` for a format of pure
     fractions.
 
-    Every :class:`RoundMode` applies, as for :class:`BinaryK`, except
-    :attr:`RoundMode.SR`, which is not implemented yet. Below the step
+    Every :class:`RoundMode` applies, as for :class:`BinaryK`. Below the step
     the two candidates are zero and ``2**-fl``, picked as :class:`SubnormalsMode`
     describes. A result beyond the range saturates to its end, an infinite
     input included, because a fixed-point word has no code for an infinity, so
@@ -1806,8 +1810,9 @@ class FixedPoint(Number):
     Raises:
         ValueError: for a ``wl`` too short, a symmetric unsigned format, a
             negative ``prng_bits``, or what binary64 cannot simulate: more
-            than 53 bits of precision, with or without ``prng_bits``, or a
-            largest value below its normals. Each call checks the format
+            than 52 bits of precision, with or without ``prng_bits``, a
+            largest value below its normals, or a range reaching its top
+            binade. Each call checks the format
             against its own carrier (see :class:`FormatRangeWarning`).
 
     Example::
