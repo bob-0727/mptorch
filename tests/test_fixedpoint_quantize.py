@@ -17,8 +17,9 @@ float32 and float64 ones, which plays the part gfloat plays for binaryK.
 Stochastic rounding cannot be held to a value, so it is held to its properties
 instead, as binaryK's and superfp's are: grid points are left alone, every
 result is one of the input's two neighbours, the mean is the input, and the
-draws depend on the seed and the element's index alone. The CPU is the only
-backend.
+draws depend on the seed and the element's index alone. Every test runs on the
+CPU and on CUDA; tests/test_cast_fast_paths.py holds the two backends to the
+same bits.
 """
 
 import math
@@ -30,10 +31,11 @@ import torch
 
 from mptorch.number import RoundMode
 from mptorch.quant import fixedpoint_quantize, fixedpoint_quantize_
+from tests.markers import cuda_devices
 
-# The CPU is the only backend with a kernel so far; `available_devices` from
-# tests.markers once the CUDA and MPS kernels exist.
-DEVICES = ["cpu"]
+# The CPU and CUDA have kernels, CUDA skipped where there is no device;
+# `available_devices` from tests.markers once the MPS kernel exists.
+DEVICES = ["cpu", *cuda_devices]
 
 # The reference format: 1 sign bit and 3 magnitude bits, 2 of them fractional.
 # Codes -8 .. 7 hold -2 .. 1.75 in steps of 0.25.

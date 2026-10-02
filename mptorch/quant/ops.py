@@ -1477,8 +1477,8 @@ def fixedpoint_quantize(
     ``saturation_mode``. NaN inputs pass through.
 
     Dtypes, the carrier, the storage check, ``prng_bits`` and
-    differentiability are as for :func:`binaryK_quantize`. It has no CUDA or
-    MPS kernel yet and raises on a tensor of either.
+    differentiability are as for :func:`binaryK_quantize`. It has no MPS
+    kernel yet and raises on an MPS tensor.
 
     Args:
         x (Tensor): the tensor to round; float32, float64, float16 or
@@ -1508,8 +1508,7 @@ def fixedpoint_quantize(
             ``carrier`` is a dtype that names no carrier or is narrower than
             ``x``.
         TypeError: if ``carrier`` is neither a ``torch.dtype`` nor ``None``.
-        RuntimeError: if ``x`` requires grad under grad mode, or is not on the
-            CPU.
+        RuntimeError: if ``x`` requires grad under grad mode, or is on MPS.
 
     Warns:
         FormatRangeWarning: if the format's range outruns the carrier's, or a
@@ -1566,9 +1565,9 @@ def fixedpoint_quantize_(
 
     The in-place spelling of :func:`fixedpoint_quantize`: the same arguments,
     checks and result, written over ``x``, with no output allocation. What it
-    is for and what it refuses (a tensor that is not contiguous, a ``carrier``
-    wider than ``x``) are as for :func:`binaryK_quantize_`. Like
-    :func:`fixedpoint_quantize` it has a CPU kernel only so far.
+    is for and what it refuses (a tensor that is not contiguous, a CUDA view
+    off a 16-byte boundary, a ``carrier`` wider than ``x``, an MPS tensor) are
+    as for :func:`binaryK_quantize_`.
 
     Args:
         x (Tensor): the tensor to round and overwrite; float32, float64,
@@ -1585,7 +1584,7 @@ def fixedpoint_quantize_(
             wider than ``x``.
         TypeError: if ``carrier`` is neither a ``torch.dtype`` nor ``None``.
         RuntimeError: if ``x`` requires grad under grad mode, is not
-            contiguous, or is not on the CPU.
+            contiguous, is a CUDA view off a 16-byte boundary, or is on MPS.
 
     Warns:
         FormatRangeWarning: as for :func:`fixedpoint_quantize`.

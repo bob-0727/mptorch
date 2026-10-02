@@ -9,8 +9,10 @@
 TORCH_LIBRARY_IMPL(mptorch, CUDA, m)
 {
     m.impl("binaryK_quant", TORCH_FN(binaryK_quantize_cuda));
+    m.impl("fixedpoint_quant", TORCH_FN(fixedpoint_quantize_cuda));
     m.impl("superfp_quant", TORCH_FN(superfp_quantize_cuda));
     m.impl("binaryK_quant_", TORCH_FN(binaryK_quantize_cuda_));
+    m.impl("fixedpoint_quant_", TORCH_FN(fixedpoint_quantize_cuda_));
     m.impl("superfp_quant_", TORCH_FN(superfp_quantize_cuda_));
     m.impl("narrow_float64", TORCH_FN(narrow_float64_cuda));
     m.impl("custom_matmul_binaryK", TORCH_FN(binaryK_matmul_cuda));

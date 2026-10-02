@@ -1559,7 +1559,7 @@ class Number:
 
     Subclassed by :class:`FloatFormat` and :class:`FixedPoint` today.
     :class:`FixedPoint` is a work in progress: it has an elementwise
-    quantizer on the CPU, and no GEMM yet. Block floating point, block minifloats,
+    quantizer on the CPU and CUDA, and no GEMM yet. Block floating point, block minifloats,
     logarithmic and tapered (posit) formats belong here too; each needs a
     kernel first, so none of them is declared as an empty class in the
     meantime.
