@@ -1,9 +1,9 @@
-// The MPS kernels behind mptorch::binaryK_quant and mptorch::superfp_quant:
-// a new tensor of the input's shape and dtype, every element rounded by
-// quantize.metal, in the same cast, the same rounding mode and, under
-// RoundMode::SR, the same random word as the CPU kernel gives it
-// (cpu/binaryK_kernel.cpp, cpu/superfp_kernel.cpp), so the result is the
-// CPU's bit for bit.
+// The MPS kernels behind mptorch::binaryK_quant, mptorch::superfp_quant and
+// mptorch::fixedpoint_quant: a new tensor of the input's shape and dtype,
+// every element rounded by quantize.metal, in the same cast, the same rounding
+// mode and, under RoundMode::SR, the same random word as the CPU kernel gives
+// it (cpu/binaryK_kernel.cpp, cpu/superfp_kernel.cpp,
+// cpu/fixedpoint_kernel.cpp), so the result is the CPU's bit for bit.
 //
 // Each entry point observes what its CPU twin does, in the same order: the
 // input is made contiguous, the output allocated, the seed drawn under SR
@@ -74,7 +74,7 @@ Tensor binaryK_quantize_mps(Tensor a, int64_t K, int64_t P, int64_t bias, int64_
   const int exp_bits = is_signed ? K_ - P_ : K_ - P_ + 1;
   const bool extended = static_cast<SubnormalsMode>(subnormals_mode) == SubnormalsMode::EXTENDED_NORMALS;
   const std::string format =
-      "#define MPT_SUPERFP 0\n#define MPT_SUBNORMALS SubnormalsMode(" +
+      "#define MPT_FORMATS 0\n#define MPT_SUBNORMALS SubnormalsMode(" +
       std::to_string(subnormals_mode) +
       ")\ninline BinaryKParams mpt_params()\n{\n    return make_binaryK_params<float>(" +
       std::to_string(man_bits) + ", " + std::to_string(exp_bits) + ", " +
@@ -89,7 +89,7 @@ Tensor superfp_quantize_mps(Tensor a, int64_t man_bits, int64_t exp_bits, int64_
                             int64_t saturation_mode)
 {
   const std::string format =
-      "#define MPT_SUPERFP 1\n#define MPT_SUBNORMALS SubnormalsMode::SUBNORMALS\n"
+      "#define MPT_FORMATS 1\n#define MPT_SUBNORMALS SubnormalsMode::SUBNORMALS\n"
       "inline SuperfpParams mpt_params()\n{\n    return make_superfp_params<float>(" +
       std::to_string(static_cast<int>(man_bits)) + ", " + std::to_string(static_cast<int>(exp_bits)) +
       ", " + std::to_string(static_cast<int>(normal_binades)) + ", " +
@@ -98,8 +98,20 @@ Tensor superfp_quantize_mps(Tensor a, int64_t man_bits, int64_t exp_bits, int64_
   return quantize("superfp_quantize_mps", a, round_mode, is_signed, prng_bits, format);
 }
 
-// mptorch::binaryK_quant_ and mptorch::superfp_quant_ on an MPS tensor: not
-// yet. The Metal kernel is small (mpt_quantize reads x[i] before it writes
+Tensor fixedpoint_quantize_mps(Tensor a, int64_t wl, int64_t fl, int64_t prng_bits,
+                               bool is_signed, bool symmetric, int64_t round_mode)
+{
+  const std::string format =
+      "#define MPT_FORMATS 2\n#define MPT_SUBNORMALS SubnormalsMode::SUBNORMALS\n"
+      "inline FixedPointParams mpt_params()\n{\n    return make_fixedpoint_params<float>(" +
+      std::to_string(static_cast<int>(wl)) + ", " + std::to_string(static_cast<int>(fl)) +
+      ", " + (is_signed ? "true" : "false") + ", " +
+      (symmetric ? "true" : "false") + ");\n}\n";
+  return quantize("fixedpoint_quantize_mps", a, round_mode, is_signed, prng_bits, format);
+}
+
+// mptorch::binaryK_quant_, mptorch::superfp_quant_ and mptorch::fixedpoint_quant_
+// on an MPS tensor: not yet. The Metal kernel is small (mpt_quantize reads x[i] before it writes
 // y[i], so binding one buffer twice is value-safe) and is the first item of
 // dev/continuation_plan.md's phase H; until then the ops say so rather than
 // fail at dispatch. (The return is never reached; it is there so that no
@@ -117,5 +129,12 @@ Tensor &superfp_quantize_mps_(Tensor &a, int64_t, int64_t, int64_t, int64_t, int
 {
   TORCH_CHECK(false, "superfp_quant_ has no MPS kernel yet (dev/continuation_plan.md, phase H): "
                      "use superfp_quant, the out-of-place op, on an MPS tensor");
+  return a;
+}
+
+Tensor &fixedpoint_quantize_mps_(Tensor &a, int64_t, int64_t, int64_t, bool, bool, int64_t)
+{
+  TORCH_CHECK(false, "fixedpoint_quant_ has no MPS kernel yet (dev/continuation_plan.md, phase H): "
+                     "use fixedpoint_quant, the out-of-place op, on an MPS tensor");
   return a;
 }

@@ -19,7 +19,7 @@ namespace
   // carrier_t<scalar_t>: binary64 for float64, binary32 otherwise.
   template <typename scalar_t, bool IsSigned, class Cast>
   void fixedpoint_run(const scalar_t *a, scalar_t *o, int64_t size,
-                   const FixedPointParamsT<carrier_t<scalar_t>> &p, Cast cast)
+                      const FixedPointParamsT<carrier_t<scalar_t>> &p, Cast cast)
   {
     quant_kernel(a, o, size,
                  [=](scalar_t x) -> scalar_t
@@ -34,7 +34,7 @@ namespace
   // outside the loop, one closure type per arm.
   template <typename scalar_t, bool IsSigned>
   void fixedpoint_kernel_impl(const scalar_t *a, scalar_t *o, int64_t size, int wl,
-                           int fl, bool symmetric, RoundMode round_mode)
+                              int fl, bool symmetric, RoundMode round_mode)
   {
     const FixedPointParamsT<carrier_t<scalar_t>> p = make_fixedpoint_params<carrier_t<scalar_t>>(
         wl, fl, IsSigned, symmetric);

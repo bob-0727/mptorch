@@ -12,30 +12,37 @@ and past either end the result saturates. The round-to-nearest-even tables
 come first; the other deterministic modes follow, one row per mode.
 
 Every table is checked a second way by a sweep against an exact reference, the
-rounding done in Python's ``fractions`` over every float16 value and random
-float32 and float64 ones, which plays the part gfloat plays for binaryK.
+rounding done in Python's integers over every float16 value and random float32
+and float64 ones, which plays the part gfloat plays for binaryK; and the grid
+points and ties at both ends of each format are swept too, in binary32 and in
+binary64, along with the formats on binary32's edges.
 Stochastic rounding cannot be held to a value, so it is held to its properties
 instead, as binaryK's and superfp's are: grid points are left alone, every
-result is one of the input's two neighbours, the mean is the input, and the
-draws depend on the seed and the element's index alone. Every test runs on the
-CPU and on CUDA; tests/test_cast_fast_paths.py holds the two backends to the
-same bits.
+result is one of the input's two neighbours, the mean is the input, and
+``prng_bits`` sets the resolution. Every test runs on the CPU, CUDA and MPS,
+except where it needs float64, which MPS has no tensors of;
+tests/test_cast_fast_paths.py and tests/test_mps.py hold the backends to the
+CPU's bits. The in-place op, the carrier, strided inputs and the seed are
+tested with the other quantizers', in tests/test_quantize_inplace.py,
+tests/test_quantize_dispatch.py and tests/test_sr_rng.py.
 """
 
 import math
 import random
-from fractions import Fraction
+import warnings
 
 import pytest
 import torch
 
-from mptorch.number import RoundMode
-from mptorch.quant import fixedpoint_quantize, fixedpoint_quantize_
-from tests.markers import cuda_devices
+from mptorch.number import FormatRangeWarning, RoundMode
+from mptorch.quant import fixedpoint_quantize
+from tests.markers import available_devices, float64_devices, has_float64
 
-# The CPU and CUDA have kernels, CUDA skipped where there is no device;
-# `available_devices` from tests.markers once the MPS kernel exists.
-DEVICES = ["cpu", *cuda_devices]
+# Every backend, each skipped where there is no such device. MPS has no float64
+# tensors: a test parametrized over a float64 dtype is skipped there by
+# conftest.py, and one that needs float64 whatever its parameters takes
+# float64_devices.
+DEVICES = available_devices
 
 # The reference format: 1 sign bit and 3 magnitude bits, 2 of them fractional.
 # Codes -8 .. 7 hold -2 .. 1.75 in steps of 0.25.
@@ -127,7 +134,8 @@ def test_below_the_step(device, value, expected):
 # already past it or rounding carried it there. 1.875 is the tie between 1.75
 # (code 7) and 2.0 (code 8, past the top), and goes to the even code 8, which
 # saturates back to 1.75. The range is two's complement, so the bottom, -2, is
-# one step further from zero than the top.
+# one step further from zero than the top. An infinity saturates too, since a
+# fixed-point word has no code for one.
 ENDS_CASES = [
     (1.75, MAX),
     (1.8, MAX),
@@ -135,22 +143,25 @@ ENDS_CASES = [
     (1.9, MAX),
     (100.0, MAX),
     (1e30, MAX),
+    (float("inf"), MAX),
     (-2.0, MIN),
     (-2.1, MIN),
     (-2.125, MIN),  # tie -> code -8, the bottom itself
     (-2.2, MIN),
     (-100.0, MIN),
     (-1e30, MIN),
+    (float("-inf"), MIN),
 ]
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("mode", EVERY_MODE)
-@pytest.mark.parametrize("value,expected", ENDS_CASES)
-def test_ends_saturate(device, mode, value, expected):
+def test_ends_saturate(device, mode):
     """Every mode saturates the same way, SR in every draw: each rounds these
     values onto one end or past it, and past it is the end."""
-    assert _same(_quantize(value, device, mode=mode), expected)
+    for value, expected in ENDS_CASES:
+        got = _quantize(value, device, mode=mode)
+        assert _same(got, expected), f"{value} -> {got}, expected {expected}"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -177,15 +188,6 @@ def test_unsigned(device, mode):
     assert _same(_quantize(float("inf"), device, **kw), 3.75)
 
 
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", EVERY_MODE)
-def test_infinities_saturate(device, mode):
-    """An infinity saturates to the end on its side, since a fixed-point word has
-    no code for one. A NaN passes through: test_nan_passes_through_whole."""
-    assert _same(_quantize(float("inf"), device, mode=mode), MAX)
-    assert _same(_quantize(float("-inf"), device, mode=mode), MIN)
-
-
 # Signalling and quiet NaNs of both signs, with small, full and mixed payloads,
 # as in tests/test_binaryk_p3109.py. The float64 words add payloads in the low
 # 32 bits, which a cast that went through float32 would lose. float16 and
@@ -208,13 +210,13 @@ NANS64 = torch.cat([NANS64, NANS64 | torch.tensor(-(2**63), dtype=torch.int64)])
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", EVERY_MODE)
 @pytest.mark.parametrize("is_signed", [True, False], ids=["signed", "unsigned"])
 @pytest.mark.parametrize(
     "nans,wl,fl", [(NANS32, 8, 4), (NANS32, 4, 2), (NANS64, 8, 4), (NANS64, 40, 30)]
 )
-def test_nan_passes_through_whole(device, mode, is_signed, nans, wl, fl):
-    """A NaN comes back bit for bit: payload, signalling bit and sign.
+def test_nan_passes_through_whole(device, is_signed, nans, wl, fl):
+    """A NaN comes back bit for bit, in every mode: payload, signalling bit and
+    sign.
 
     The directed modes are where that is not free: a NaN compares false against
     zero, so it takes the arm that works on a magnitude and negates it back, and
@@ -222,12 +224,15 @@ def test_nan_passes_through_whole(device, mode, is_signed, nans, wl, fl):
     negative input into zero, but a NaN with its sign bit set is unordered, not
     negative, so it passes through too. Under SR it is returned before any draw
     is used."""
+    if nans.dtype is torch.int64 and not has_float64(device):
+        pytest.skip("MPS has no float64 tensors.")
     x = nans.view(torch.float32 if nans.dtype is torch.int32 else torch.float64).to(device)
-    prng_bits = SR_BITS if mode is RoundMode.SR else 0
-    got = fixedpoint_quantize(
-        x, wl, fl, prng_bits=prng_bits, is_signed=is_signed, rounding_mode=mode
-    )
-    assert torch.equal(got.cpu().view(nans.dtype), nans)
+    for mode in EVERY_MODE:
+        prng_bits = SR_BITS if mode is RoundMode.SR else 0
+        got = fixedpoint_quantize(
+            x, wl, fl, prng_bits=prng_bits, is_signed=is_signed, rounding_mode=mode
+        )
+        assert torch.equal(got.cpu().view(nans.dtype), nans), mode
 
 
 # ---------------------------------------------------------------------------
@@ -308,17 +313,11 @@ def test_other_steps(device, cfg, value, expected):
     assert _same(_quantize(value, device, cfg=cfg), expected)
 
 
-@pytest.mark.parametrize("device", DEVICES)
-def test_docstring_example(device):
-    x = torch.tensor([1.1, 3.3, -9.0, 0.03], device=device)
-    assert fixedpoint_quantize(x, 8, 4).tolist() == [1.125, 3.3125, -8.0, 0.0]
-
-
 # ---------------------------------------------------------------------------
-# The exact reference: the same rounding in Python's fractions, where nothing is
+# The exact reference: the same rounding in Python's integers, where nothing is
 # rounded but the rule itself. The kernel's result is stored in the tensor's
-# dtype, so the reference's is too: through float32, where every value of these
-# formats is exact, and then once into the dtype.
+# dtype, so the reference's is too, rounded once into it. A result the dtype
+# cannot hold comes back changed, which the format's storage check must warn of.
 
 
 def _reference(
@@ -328,22 +327,24 @@ def _reference(
     if math.isnan(x):
         return x
     mag_bits = wl - (1 if is_signed else 0)
-    step = Fraction(2) ** -fl
-    top = (2**mag_bits - 1) * step
-    bottom = Fraction(0) if not is_signed else (-top if symmetric else -(2**mag_bits) * step)
+    # the ends as codes, multiples of the step 2**-fl
+    top = 2**mag_bits - 1
+    bottom = 0 if not is_signed else (-top if symmetric else -(2**mag_bits))
     if math.isinf(x):
-        return float(top if x > 0 else bottom)
+        return math.ldexp(top if x > 0 else bottom, -fl)
     if x < 0 and not is_signed:
         return 0.0
-    # the code below the value, and how far past it the value is, in [0, 1)
-    code, rest = divmod(Fraction(x) / step, 1)
-    half = Fraction(1, 2)
-    if rest == 0:
+    # x / step as num / den, exactly: a float is an integer over a power of two
+    n, d = x.as_integer_ratio()
+    num, den = (n << fl, d) if fl >= 0 else (n, d << -fl)
+    # the code below the value, and how far past it the value is, rem / den
+    code, rem = divmod(num, den)
+    if rem == 0:
         up = False  # on the grid: every mode leaves it alone
     elif mode is RoundMode.RNE:
-        up = rest > half or (rest == half and code % 2 == 1)
+        up = 2 * rem > den or (2 * rem == den and code % 2 == 1)
     elif mode is RoundMode.RNA:
-        up = rest > half or (rest == half and x > 0)
+        up = 2 * rem > den or (2 * rem == den and x > 0)
     elif mode is RoundMode.RU:
         up = True
     elif mode is RoundMode.RD:
@@ -355,7 +356,7 @@ def _reference(
     else:
         raise ValueError(f"no reference for {mode}")
     code += up
-    return float(min(max(code * step, bottom), top)) + 0.0  # + 0.0: no -0.0
+    return math.ldexp(min(max(code, bottom), top), -fl) + 0.0  # + 0.0: no -0.0
 
 
 def _float16_values() -> list[float]:
@@ -389,23 +390,37 @@ FORMATS = [
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
-@pytest.mark.parametrize("wl,fl,is_signed,symmetric", FORMATS)
-def test_against_the_exact_reference(device, mode, dtype, wl, fl, is_signed, symmetric):
-    """Every float16 value (in float16) or 5000 random ones (in the other dtypes)
-    rounds as the reference rounds it, word for word, signed zeros included."""
-    values = _float16_values() if dtype is torch.float16 else _random_values(wl * 100 + fl)
-    x = torch.tensor(values, dtype=torch.float64).to(dtype).to(device)
-    got = fixedpoint_quantize(
-        x, wl, fl, is_signed=is_signed, symmetric=symmetric, rounding_mode=mode
-    )
-    want = torch.tensor(
-        [_reference(v, wl, fl, is_signed, symmetric, mode) for v in x.double().tolist()],
-        dtype=torch.float64,
-    )
-    want = want.to(torch.float32).to(dtype) if dtype is not torch.float64 else want
-    same = (got.cpu() == want) & (torch.signbit(got.cpu()) == torch.signbit(want))
-    same |= torch.isnan(got.cpu()) & torch.isnan(want)
-    assert bool(same.all()), f"first mismatch at x={x[~same][0].item()!r}"
+def test_against_the_exact_reference(device, mode, dtype):
+    """In every format of FORMATS, every float16 value (in float16) or 5000
+    random ones (in the other dtypes) rounds as the reference rounds it, word
+    for word, signed zeros included. Where the dtype cannot hold the exact
+    result (the format's end past float16's range, say, or with more bits
+    than bfloat16 has), the result is the exact one rounded once into the
+    dtype, and only with a FormatRangeWarning saying so."""
+    for wl, fl, is_signed, symmetric in FORMATS:
+        fmt = f"FixedPoint({wl}, {fl}, is_signed={is_signed}, symmetric={symmetric})"
+        values = _float16_values() if dtype is torch.float16 else _random_values(wl * 100 + fl)
+        x = torch.tensor(values, dtype=torch.float64).to(dtype).to(device)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FormatRangeWarning)
+            got = fixedpoint_quantize(
+                x, wl, fl, is_signed=is_signed, symmetric=symmetric, rounding_mode=mode
+            )
+        exact = torch.tensor(
+            [_reference(v, wl, fl, is_signed, symmetric, mode) for v in x.cpu().double().tolist()],
+            dtype=torch.float64,
+        )
+        want = exact.to(dtype)
+        got = got.cpu()
+        same = (got == want) & (torch.signbit(got) == torch.signbit(want))
+        same |= torch.isnan(got) & torch.isnan(want)
+        assert bool(same.all()), f"{fmt}: first mismatch at x={x.cpu()[~same][0].item()!r}"
+        held = (want.double() == exact) | torch.isnan(exact)
+        warned = any(issubclass(w.category, FormatRangeWarning) for w in caught)
+        assert warned or bool(held.all()), (
+            f"{fmt}: x={x.cpu()[~held][0].item()!r} rounds to {exact[~held][0].item()!r}, "
+            f"which {dtype} stores as {want[~held][0].item()!r}, with no FormatRangeWarning"
+        )
 
 
 # Formats only binary64 carries: more than binary32's 23 mantissa bits, a step
@@ -423,10 +438,13 @@ WIDE_FORMATS = [
 ]
 
 
-def _wide_values(wl: int, fl: int, is_signed: bool) -> list[float]:
-    """float64 values across a wide format: random significands from three
-    binades under the step to one past the top, both signs, and the grid points
-    and midpoints at both ends with a float64 ulp either side of each."""
+def _wide_values(
+    wl: int, fl: int, is_signed: bool, dtype: torch.dtype = torch.float64
+) -> list[float]:
+    """Values across a format: random significands from three binades under
+    the step to one past the top, both signs, and the grid points and
+    midpoints at both ends with a ``dtype`` ulp either side of each (a float64
+    ulp is lost once the value is stored in a narrower dtype)."""
     rng = random.Random(wl * 10_000 + fl)
     mag_bits = wl - (1 if is_signed else 0)
     step_exp, top_exp = -fl, mag_bits - 1 - fl
@@ -435,29 +453,90 @@ def _wide_values(wl: int, fl: int, is_signed: bool) -> list[float]:
     ]
     for code in (1, 2, 3, 2**mag_bits - 3, 2**mag_bits - 2, 2**mag_bits - 1):
         point = math.ldexp(code, step_exp)
-        half = math.ldexp(2 * code + 1, step_exp - 1)  # rounded where it needs 54 bits
+        half = math.ldexp(2 * code + 1, step_exp - 1)  # rounded where dtype cannot hold it
         for v in (point, half):
-            values += [v, math.nextafter(v, math.inf), math.nextafter(v, 0.0)]
+            t = torch.tensor([v] * 3, dtype=torch.float64).to(dtype)
+            towards = torch.tensor([v, math.inf, 0.0], dtype=torch.float64).to(dtype)
+            values += torch.nextafter(t, towards).tolist()
     return values + [-v for v in values]
 
 
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", ALL_MODES)
+@pytest.mark.parametrize("device", float64_devices)
 @pytest.mark.parametrize("wl,fl,is_signed,symmetric", WIDE_FORMATS)
-def test_formats_past_binary32(device, mode, wl, fl, is_signed, symmetric):
+def test_formats_past_binary32(device, wl, fl, is_signed, symmetric):
     """A float64 tensor rounds in binary64 to formats binary32 cannot hold, as
-    the reference does. Catches a cast constant, mask or bound still sized for
-    binary32 (a 32-bit word, a 23-bit mantissa) in the ``double`` instantiation."""
+    the reference does, in every mode. Catches a cast constant, mask or bound
+    still sized for binary32 (a 32-bit word, a 23-bit mantissa) in the
+    ``double`` instantiation."""
     x = torch.tensor(_wide_values(wl, fl, is_signed), dtype=torch.float64, device=device)
+    for mode in ALL_MODES:
+        got = fixedpoint_quantize(
+            x, wl, fl, is_signed=is_signed, symmetric=symmetric, rounding_mode=mode
+        ).cpu()
+        want = torch.tensor(
+            [_reference(v, wl, fl, is_signed, symmetric, mode) for v in x.tolist()],
+            dtype=torch.float64,
+        )
+        same = (got == want) & (torch.signbit(got) == torch.signbit(want))
+        assert bool(same.all()), f"{mode.name}: first mismatch at x={x[~same][0].item()!r}"
+
+
+# Formats on binary32's edges, each the last one tests/test_format_limits.py
+# holds silent there: a step at the floor the casts place values by, a top
+# whose SR shift is binary32's top binade, and all 23 of its mantissa bits.
+EDGE_FORMATS = [
+    # (wl, fl, is_signed, symmetric)
+    (8, 125, True, False),  # a step of 2**-125
+    (8, -120, True, False),  # a top of 127 * 2**120, SR's shift 2**127
+    (24, 0, True, False),  # 23 magnitude bits
+    (23, 0, False, False),  # 23 magnitude bits, unsigned
+]
+
+
+def _same_as_reference(
+    x: torch.Tensor, wl: int, fl: int, is_signed: bool, symmetric: bool, mode: RoundMode
+) -> torch.Tensor:
+    """Elementwise: ``x`` quantized to the format is the reference's result,
+    stored in ``x``'s dtype, signed zeros included."""
     got = fixedpoint_quantize(
         x, wl, fl, is_signed=is_signed, symmetric=symmetric, rounding_mode=mode
     ).cpu()
     want = torch.tensor(
-        [_reference(v, wl, fl, is_signed, symmetric, mode) for v in x.tolist()],
+        [_reference(v, wl, fl, is_signed, symmetric, mode) for v in x.cpu().tolist()],
         dtype=torch.float64,
-    )
-    same = (got == want) & (torch.signbit(got) == torch.signbit(want))
-    assert bool(same.all()), f"first mismatch at x={x[~same][0].item()!r}"
+    ).to(x.dtype)
+    return (got == want) & (torch.signbit(got) == torch.signbit(want))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_grid_ends_in_binary32(device):
+    """In binary32, in every format of FORMATS and EDGE_FORMATS, the grid
+    points and ties at both ends, with a binary32 ulp either side of each,
+    round as the reference rounds them, in every mode. Random inputs all but
+    never land on a tie, and the float16 sweep only reaches ties of up to 11
+    significant bits, so this is where a tie of up to 24 is held. It also holds
+    the formats on binary32's edges, which tests/test_format_limits.py holds
+    silent, to the values they give."""
+    for wl, fl, is_signed, symmetric in FORMATS + EDGE_FORMATS:
+        fmt = f"FixedPoint({wl}, {fl}, is_signed={is_signed}, symmetric={symmetric})"
+        values = _wide_values(wl, fl, is_signed, torch.float32)
+        x = torch.tensor(values, dtype=torch.float64).to(torch.float32).to(device)
+        for mode in ALL_MODES:
+            same = _same_as_reference(x, wl, fl, is_signed, symmetric, mode)
+            assert bool(same.all()), (
+                f"{fmt} {mode.name}: first mismatch at x={x.cpu()[~same][0].item()!r}"
+            )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_one_step_below_binary32s_floor_rounds_wrongly(device):
+    """A step of 2**-126, one finer than EDGE_FORMATS' 2**-125, does round some
+    values wrongly in binary32, so the warning tests/test_format_limits.py
+    expects there marks a real failure rather than a cautious margin. If the
+    cast comes to round it correctly, this fails, and the floor should move."""
+    values = _wide_values(8, 126, True, torch.float32)
+    x = torch.tensor(values, dtype=torch.float64).to(torch.float32).to(device)
+    assert not bool(_same_as_reference(x, 8, 126, True, False, RoundMode.RNE).all())
 
 
 # ---------------------------------------------------------------------------
@@ -479,61 +558,74 @@ def _sr(x: torch.Tensor, wl: int, fl: int, prng_bits: int = SR_BITS, **kw) -> to
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("wl,fl,is_signed,symmetric", FORMATS)
-def test_sr_leaves_grid_points_alone(device, dtype, wl, fl, is_signed, symmetric):
-    """A value on the grid has nothing below the step for a draw to carry into,
-    so every draw returns it. The grid points are the format's RNE results, which
-    float32 and float64 hold exactly."""
-    kw = dict(is_signed=is_signed, symmetric=symmetric)
-    x = torch.tensor(_random_values(wl * 100 + fl), dtype=torch.float64).to(dtype).to(device)
-    grid = fixedpoint_quantize(x, wl, fl, **kw)
-    got = _sr(grid, wl, fl, prng_bits=_sr_bits(wl, is_signed, dtype), **kw)
-    assert torch.equal(got.nan_to_num(0.5), grid.nan_to_num(0.5))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_sr_lands_on_a_neighbour(device, dtype):
+    """In every format of FORMATS, and of WIDE_FORMATS in float64, every draw is
+    the RD or the RU result for its input, saturated as they are, and a zero
+    result is +0.0. Each input is repeated so that both of its neighbours are
+    reached. The inputs' RNE results are inputs too: on a grid point RD and RU
+    are the point itself, so every draw must leave it alone."""
+    wide = WIDE_FORMATS if dtype is torch.float64 else []
+    for wl, fl, is_signed, symmetric in FORMATS + wide:
+        kw = dict(is_signed=is_signed, symmetric=symmetric)
+        fmt = f"FixedPoint({wl}, {fl}, is_signed={is_signed}, symmetric={symmetric})"
+        values = (
+            _wide_values(wl, fl, is_signed)
+            if (wl, fl, is_signed, symmetric) in wide
+            else _random_values(wl * 100 + fl)
+        )
+        x = torch.tensor(values, dtype=torch.float64).to(dtype).to(device)
+        x = torch.cat([x, fixedpoint_quantize(x, wl, fl, **kw)]).repeat(4)
+        got = _sr(x, wl, fl, prng_bits=_sr_bits(wl, is_signed, dtype), **kw)
+        down = fixedpoint_quantize(x, wl, fl, rounding_mode=RoundMode.RD, **kw)
+        up = fixedpoint_quantize(x, wl, fl, rounding_mode=RoundMode.RU, **kw)
+        ok = (got == down) | (got == up) | (torch.isnan(got) & torch.isnan(x))
+        assert bool(ok.all()), f"{fmt}: first stray result at x={x[~ok][0].item()!r}"
+        assert not bool(torch.signbit(got[got == 0]).any()), f"{fmt}: a zero is +0.0"
 
 
-NEIGHBOUR_CASES = [
-    (dtype, *fmt)
-    for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-    for fmt in FORMATS
-] + [(torch.float64, *fmt) for fmt in WIDE_FORMATS]
+SR_MEAN_CASES = [
+    # (wl, fl, is_signed, symmetric, value)
+    # the reference format, above the step and below it, where the two
+    # candidates are zero and the step
+    *[(4, 2, True, False, v) for v in (0.3, -0.3, 1.6, -1.1, 0.1, -0.05, 0.03)],
+    (8, -3, True, False, 13.0),  # a step of 8
+    (8, -3, True, False, -3.0),  # under that step
+    (12, 4, False, False, 3.3),  # unsigned
+    (4, 2, True, True, -1.6),  # symmetric, near its bottom, -1.75
+    (40, 30, True, False, 0.3),  # 39 magnitude bits, which only binary64 carries
+]
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("dtype,wl,fl,is_signed,symmetric", NEIGHBOUR_CASES)
-def test_sr_lands_on_a_neighbour(device, dtype, wl, fl, is_signed, symmetric):
-    """Every draw is the RD or the RU result for its input, saturated as they are,
-    and a zero result is +0.0. Each input is repeated so that both of its
-    neighbours are reached."""
-    kw = dict(is_signed=is_signed, symmetric=symmetric)
-    wide = (wl, fl, is_signed, symmetric) in WIDE_FORMATS
-    values = _wide_values(wl, fl, is_signed) if wide else _random_values(wl * 100 + fl)
-    x = torch.tensor(values, dtype=torch.float64).to(dtype).to(device).repeat(4)
-    got = _sr(x, wl, fl, prng_bits=_sr_bits(wl, is_signed, dtype), **kw)
-    down = fixedpoint_quantize(x, wl, fl, rounding_mode=RoundMode.RD, **kw)
-    up = fixedpoint_quantize(x, wl, fl, rounding_mode=RoundMode.RU, **kw)
-    ok = (got == down) | (got == up) | (torch.isnan(got) & torch.isnan(x))
-    assert bool(ok.all()), f"first stray result at x={x[~ok][0].item()!r}"
-    assert not bool(torch.signbit(got[got == 0]).any()), "a fixed-point zero is +0.0"
-
-
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("value", [0.3, -0.3, 1.6, -1.1, 0.1, -0.05, 0.03])
-def test_sr_is_unbiased(device, dtype, value):
-    """The mean of the draws is the input: above the step (0.3, -0.3, 1.6, -1.1),
-    and below it (0.1, -0.05, 0.03), where the two candidates are zero and the
-    step. The fraction of draws that round up is a binomial
-    proportion, held to six standard errors plus the draw's resolution, 2**-16."""
+def test_sr_is_unbiased(device, dtype):
+    """In every case of SR_MEAN_CASES whose magnitude bits fit the carrier's
+    mantissa, the mean of the draws is the input: formats of each kind SR
+    shifts differently, steps finer and coarser than 1, unsigned, symmetric,
+    and past binary32's precision. The fraction of draws that round up is a
+    binomial proportion, held to six standard errors plus the draw's
+    resolution, 2**-prng_bits, with up to 16 random bits beside the format's in
+    the carrier's mantissa."""
     n = 400_000
-    x = torch.full((n,), value, dtype=dtype, device=device)
-    value = x[0].item()  # the value the dtype holds
-    got = _sr(x, **CFG, prng_bits=16).double()
-    below = math.floor(value / STEP) * STEP
-    assert set(got.unique().tolist()) <= {below, below + STEP}
-    frac = (value - below) / STEP
-    tolerance = 6 * math.sqrt(frac * (1 - frac) / n) + 2.0**-16
-    assert (got.mean().item() - below) / STEP == pytest.approx(frac, abs=tolerance)
+    man_bits = 52 if dtype is torch.float64 else 23
+    for wl, fl, is_signed, symmetric, value in SR_MEAN_CASES:
+        mag_bits = wl - (1 if is_signed else 0)
+        if mag_bits > man_bits:
+            continue
+        fmt = f"FixedPoint({wl}, {fl}, is_signed={is_signed}, symmetric={symmetric})"
+        prng_bits = min(16, man_bits - mag_bits)
+        x = torch.full((n,), value, dtype=dtype, device=device)
+        value = x[0].item()  # the value the dtype holds
+        got = _sr(x, wl, fl, prng_bits=prng_bits, is_signed=is_signed, symmetric=symmetric)
+        got = got.cpu().double()
+        step = 2.0**-fl
+        below = math.floor(value / step) * step
+        assert set(got.unique().tolist()) <= {below, below + step}, f"{fmt} at {value}"
+        frac = (value - below) / step
+        tolerance = 6 * math.sqrt(frac * (1 - frac) / n) + 2.0**-prng_bits
+        mean = (got.mean().item() - below) / step
+        assert mean == pytest.approx(frac, abs=tolerance), f"{fmt} at {value}"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -547,73 +639,5 @@ def test_sr_prng_bits_set_the_resolution(device):
     assert torch.equal(_sr(x, **CFG, prng_bits=0).nan_to_num(0.5), rz.nan_to_num(0.5))
     quarter = torch.full((100_000,), STEP + STEP / 4, device=device)
     assert bool((_sr(quarter, **CFG, prng_bits=1) == STEP).all())
-    rounded_up = (_sr(quarter, **CFG, prng_bits=2) == 2 * STEP).double().mean().item()
+    rounded_up = (_sr(quarter, **CFG, prng_bits=2) == 2 * STEP).cpu().double().mean().item()
     assert rounded_up == pytest.approx(0.25, abs=0.01)
-
-
-@pytest.mark.parametrize("device", DEVICES)
-def test_sr_is_reproducible_under_manual_seed(device):
-    """``torch.manual_seed`` governs the draws, as it does torch's own random ops."""
-    x = torch.tensor(_random_values(17), device=device)
-
-    def draw(seed):
-        torch.manual_seed(seed)
-        return _sr(x, 8, 4).nan_to_num(0.5)
-
-    assert torch.equal(draw(1), draw(1))
-    assert not torch.equal(draw(1), draw(2))
-
-
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_sr_draw_is_keyed_on_the_element_index(device, dtype):
-    """The first ``n`` results of a long call are a call on those ``n`` alone.
-    4099 is prime, so the short call ends partway through a block of draws that
-    the long call is still in the middle of."""
-    x = torch.randn(100_003, dtype=dtype, device=device) * 4
-    n = 4099
-
-    def call(t):
-        torch.manual_seed(1234)
-        return _sr(t, 8, 4)
-
-    assert torch.equal(call(x)[:n], call(x[:n].clone()))
-
-
-# ---------------------------------------------------------------------------
-# The call's other spellings: the binary64 carrier and the in-place op round
-# exactly as the plain call does.
-
-
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_binary64_carrier_matches_widening_by_hand(device, dtype):
-    x = torch.tensor(_random_values(7), dtype=torch.float64).to(dtype).to(device)
-    got = fixedpoint_quantize(x, 16, 8, carrier=torch.float64)
-    by_hand = fixedpoint_quantize(x.double(), 16, 8).to(torch.float32).to(dtype)
-    assert torch.equal(got.nan_to_num(0.5), by_hand.nan_to_num(0.5))
-
-
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", EVERY_MODE)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
-def test_in_place_matches_out_of_place(device, mode, dtype):
-    """Element for element, SR included under one seed, since each element's
-    draw is keyed on its index."""
-    x = torch.tensor(_random_values(11), dtype=torch.float64).to(dtype).to(device)
-    kw = dict(rounding_mode=mode, prng_bits=SR_BITS if mode is RoundMode.SR else 0)
-    torch.manual_seed(7)
-    expected = fixedpoint_quantize(x, 8, 4, **kw)
-    y = x.clone()
-    torch.manual_seed(7)
-    assert fixedpoint_quantize_(y, 8, 4, **kw) is y
-    assert torch.equal(y.nan_to_num(0.5), expected.nan_to_num(0.5))
-
-
-@pytest.mark.parametrize("device", DEVICES)
-def test_a_strided_input_rounds_like_its_contiguous_copy(device):
-    x = torch.tensor(_random_values(13)[:1000], device=device).reshape(40, 25).t()
-    got = fixedpoint_quantize(x, 8, 4)
-    assert torch.equal(
-        got.nan_to_num(0.5), fixedpoint_quantize(x.contiguous(), 8, 4).nan_to_num(0.5)
-    )

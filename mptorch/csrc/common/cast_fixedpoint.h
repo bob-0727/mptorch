@@ -29,9 +29,11 @@ struct FixedPointParamsT
     int step_exponent_store; // the carrier's exponent field of the step 2^-fl
     int mag_bits;            // the bits stochastic rounding keeps below its shift
     int shift_exp;           // mag_bits - fl: SR's shift, one binade above the largest value
-    T max_val;              // the largest value, which +inf and overflow saturate to
+    T max_val;               // the largest value, which +inf and overflow saturate to
     T min_val;               // the smallest: 0 unsigned, -max_val symmetric, else -2^(mag_bits - fl)
 };
+
+using FixedPointParams = FixedPointParamsT<float>;
 
 // The carrier value whose word is `w`.
 template <class T>
@@ -44,9 +46,10 @@ CUDA_HOST_DEVICE_INLINE T fixedpoint_word_value(typename FloatTraits<T>::word_t 
 // not by float arithmetic, so they are exact on every backend: the largest
 // value is mag_bits ones, a leading 1 at 2^top_exp and mag_bits - 1 ones
 // below it, and the two's complement bottom is the power of two 2^min_exp.
-// The number.py checks hold both inside the carrier's normals from below; a
-// top past the carrier's largest value (a FormatRangeWarning) is an infinity,
-// since the carrier cannot hold the real bound.
+// The number.py checks hold both inside the carrier's normals from below, and
+// raise for a range reaching the carrier's top binade, so neither bound is
+// past the carrier's largest value from Python; the infinity branches below
+// are kept as a guard, since the carrier cannot hold such a bound.
 template <class T = float>
 CUDA_HOST_DEVICE_INLINE FixedPointParamsT<T> make_fixedpoint_params(int wl, int fl, bool is_signed, bool symmetric)
 {

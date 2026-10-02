@@ -814,15 +814,22 @@ def _fixedpoint_findings(
     exp_step = -fl
 
     def find(c: _Carrier) -> tuple[str | None, str | None]:
-        # error: stochastic rounding keeps all mag_bits in the carrier's mantissa
+        # error: stochastic rounding keeps all mag_bits in the carrier's mantissa,
+        # below the leading bit its shift adds, so it needs one bit of precision
+        # more than the format's values have
         if mag_bits > c.man_bits:
-            return (f"{label} needs {mag_bits} bits of precision; {c.name} has {c.man_bits}"), None
+            return (
+                f"{label} asks for {mag_bits + 1} bits of precision, its {mag_bits} magnitude "
+                f"bits below the leading bit stochastic rounding adds, and it is rounded in "
+                f"{c.name}, which has {c.precision}"
+            ), None
 
         # error: stochastic rounding draws its bits below the step, in the same significand
         if mag_bits + prng_bits > c.man_bits:
             return (
-                f"{label} needs {mag_bits} + {prng_bits} (prng_bits) bits of precision; "
-                f"{c.name} has {c.man_bits}"
+                f"{label} asks for {prng_bits} stochastic-rounding bits below {mag_bits} "
+                f"magnitude bits; they are drawn from the {c.name} significand the rounding "
+                f"happens in, which has {c.man_bits} bits to share"
             ), None
 
         # error: the whole range is below the carrier's normals
@@ -978,7 +985,7 @@ def check_fixedpoint(
 
     Raises:
         ValueError: for a layout with no values (see :class:`FixedPoint`),
-            more bits of precision than the carrier's mantissa has, with or
+            more magnitude bits than the carrier's mantissa has, with or
             without ``prng_bits``, a largest value below the carrier's
             normals, or a range reaching the carrier's top binade.
     """
@@ -1396,6 +1403,12 @@ def _fixedpoint_storage_findings(
         return None, (
             f"{label} exceeds {st.name}'s largest value; inputs near it may round to infinity"
         )
+    # an infinite input saturates onto an end of the range the dtype cannot hold
+    if max_above or min_above:
+        return None, (
+            f"{label} exceeds {st.name}'s largest value; an infinite input saturates "
+            f"onto the end of its range, which {st.name} stores as infinity"
+        )
     # an input past the format's largest value saturates onto it
     if not max_above and not _in_storage((1 << mag_bits) - 1, -fl, st):
         return None, (
@@ -1559,7 +1572,7 @@ class Number:
 
     Subclassed by :class:`FloatFormat` and :class:`FixedPoint` today.
     :class:`FixedPoint` is a work in progress: it has an elementwise
-    quantizer on the CPU and CUDA, and no GEMM yet. Block floating point, block minifloats,
+    quantizer, and no GEMM yet. Block floating point, block minifloats,
     logarithmic and tapered (posit) formats belong here too; each needs a
     kernel first, so none of them is declared as an empty class in the
     meantime.
@@ -1810,7 +1823,7 @@ class FixedPoint(Number):
     Raises:
         ValueError: for a ``wl`` too short, a symmetric unsigned format, a
             negative ``prng_bits``, or what binary64 cannot simulate: more
-            than 52 bits of precision, with or without ``prng_bits``, a
+            than 52 magnitude bits, with or without ``prng_bits``, a
             largest value below its normals, or a range reaching its top
             binade. Each call checks the format
             against its own carrier (see :class:`FormatRangeWarning`).
